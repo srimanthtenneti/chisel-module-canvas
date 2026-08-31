@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>module_canvas</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="brand">
+        <span id="conn-dot" class="dot"></span>
+        <div>
+          <h1>module_canvas</h1>
+          <p id="conn-status">connecting&hellip;</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Modules</h2>
+          <span id="module-count" class="count">0</span>
+        </div>
+        <input id="search" type="search" placeholder="filter modules&hellip;" autocomplete="off">
+        <div id="module-list"></div>
+        <p id="module-empty" class="empty hidden">
+          Nothing registered yet. From a notebook cell:
+          <code>ModuleRegistry.registerModule(new YourModule)</code>
+        </p>
+      </div>
+
+      <div class="panel">
+        <h2>Tools</h2>
+        <button id="btn-custom" class="full">+ Custom block</button>
+        <div class="btn-row">
+          <button id="btn-save">Save</button>
+          <button id="btn-export">Export SVG</button>
+        </div>
+        <button id="btn-clear" class="full danger-ghost">Clear canvas</button>
+        <p id="save-status" class="save-status"></p>
+      </div>
+
+      <div class="panel legend">
+        <h2>Legend</h2>
+        <div class="legend-row"><span class="swatch input"></span> input pin</div>
+        <div class="legend-row"><span class="swatch output"></span> output pin</div>
+        <div class="legend-row"><span class="swatch inout"></span> inout pin</div>
+        <p class="rules">
+          Wires run output&nbsp;&rarr;&nbsp;input (or through an inout).
+          An input takes exactly one wire; output&harr;output and
+          input&harr;input connections are rejected.
+        </p>
+        <p class="rules">
+          A block with a &#9656; has internal structure &mdash; click it to
+          reveal how its own submodules connect (dashed, read-only, derived
+          straight from the elaborated design). Ctrl/Cmd+C then Ctrl/Cmd+V
+          duplicates the selected block.
+        </p>
+      </div>
+    </aside>
+
+    <main id="canvas-wrap">
+      <div id="toolbar">
+        <div class="zoom-controls">
+          <button id="zoom-out" title="Zoom out">&minus;</button>
+          <span id="zoom-level">100%</span>
+          <button id="zoom-in" title="Zoom in">+</button>
+          <button id="zoom-reset" title="Reset view">reset</button>
+        </div>
+        <span id="hint">drag to pan &middot; scroll to zoom &middot; drag pin-to-pin to wire &middot; Ctrl/Cmd+C/V duplicates a block &middot; &#9656; expands internal wiring &middot; double-click a title to rename &middot; Delete removes selection</span>
+      </div>
+      <div id="scroller">
+        <svg id="canvas" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="arrow-output" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+              <path d="M0,0 L8,4 L0,8 Z" fill="#ff9f45"></path>
+            </marker>
+            <marker id="arrow-inout" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+              <path d="M0,0 L8,4 L0,8 Z" fill="#c084fc"></path>
+            </marker>
+            <marker id="arrow-selected" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+              <path d="M0,0 L8,4 L0,8 Z" fill="#4da6ff"></path>
+            </marker>
+            <pattern id="grid-pattern" width="28" height="28" patternUnits="userSpaceOnUse">
+              <circle cx="1" cy="1" r="1" class="grid-dot"></circle>
+            </pattern>
+          </defs>
+          <g id="viewport">
+            <g id="grid-layer"></g>
+            <g id="wires-layer"></g>
+            <g id="blocks-layer"></g>
+            <g id="preview-layer"></g>
+          </g>
+        </svg>
+      </div>
+    </main>
+  </div>
+
+  <div id="modal-overlay" class="hidden">
+    <div id="modal">
+      <h2>New custom block</h2>
+      <label class="field">
+        <span>Name</span>
+        <input id="cb-name" type="text" placeholder="Glue logic" autocomplete="off">
+      </label>
+      <div id="cb-ports"></div>
+      <button id="cb-add-port" type="button" class="full ghost">+ port</button>
+      <div class="modal-actions">
+        <button id="cb-cancel" type="button">Cancel</button>
+        <button id="cb-create" type="button" class="primary">Place block</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# Scala / sbt
+target/
+project/target/
+project/project/
+.bsp/
+.metals/
+.scala-build/
+
+# module_canvas runtime state (registry + saved canvas, regenerated locally)
+server/data/
+server/__pycache__/
+__pycache__/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
