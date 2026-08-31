@@ -1,4 +1,4 @@
-# module_canvas
+# Module Canvas
 
 A small background server + browser canvas for sketching how your Chisel
 modules wire together — without leaving your build or your notebook.
@@ -178,5 +178,3 @@ exact scope of what's recovered are in `docs/usage-guide.md`.
 
 Srimanth Tenneti
 
-This is a private repository; no license is granted for use outside it
-unless one is added later.
