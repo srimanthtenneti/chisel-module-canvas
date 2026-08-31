@@ -17,46 +17,101 @@
         </div>
       </div>
 
-      <div class="panel">
-        <div class="panel-head">
-          <h2>Modules</h2>
-          <span id="module-count" class="count">0</span>
-        </div>
-        <input id="search" type="search" placeholder="filter modules&hellip;" autocomplete="off">
-        <div id="module-list"></div>
-        <p id="module-empty" class="empty hidden">
-          Nothing registered yet. From a notebook cell:
-          <code>ModuleRegistry.registerModule(new YourModule)</code>
-        </p>
+      <div class="sidebar-tabs">
+        <button class="tab-btn active" data-tab="palette">Palette</button>
+        <button class="tab-btn" data-tab="inspector">Inspector<span id="inspector-badge" class="tab-badge hidden"></span></button>
+        <button class="tab-btn" data-tab="waveform">Waveform<span id="waveform-badge" class="tab-badge hidden"></span></button>
       </div>
 
-      <div class="panel">
-        <h2>Tools</h2>
-        <button id="btn-custom" class="full">+ Custom block</button>
-        <div class="btn-row">
-          <button id="btn-save">Save</button>
-          <button id="btn-export">Export SVG</button>
+      <div id="tab-palette" class="sidebar-tab">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Modules</h2>
+            <span id="module-count" class="count">0</span>
+          </div>
+          <input id="search" type="search" placeholder="filter modules&hellip;" autocomplete="off">
+          <div id="module-list"></div>
+          <p id="module-empty" class="empty hidden">
+            Nothing registered yet. Point the notebook scanner at your
+            notebook: <code>python3 register_notebook.py Notebook.ipynb</code>
+          </p>
         </div>
-        <button id="btn-clear" class="full danger-ghost">Clear canvas</button>
-        <p id="save-status" class="save-status"></p>
+
+        <div class="panel">
+          <h2>Tools</h2>
+          <button id="btn-custom" class="full">+ Custom block</button>
+          <button id="btn-io-terminal" class="full stack-top">+ Top-level IO</button>
+          <div class="btn-row">
+            <button id="btn-save">Save</button>
+            <button id="btn-export">Export SVG</button>
+          </div>
+          <button id="btn-clear" class="full danger-ghost">Clear canvas</button>
+          <p id="save-status" class="save-status"></p>
+        </div>
+
+        <div class="panel legend">
+          <h2>Legend</h2>
+          <div class="legend-row"><span class="swatch input"></span> input pin</div>
+          <div class="legend-row"><span class="swatch output"></span> output pin</div>
+          <div class="legend-row"><span class="swatch inout"></span> inout pin</div>
+          <p class="rules">
+            Wires run output&nbsp;&rarr;&nbsp;input (or through an inout).
+            An input takes exactly one wire; output&harr;output and
+            input&harr;input connections are rejected.
+          </p>
+          <p class="rules">
+            A block with a &#9656; has internal structure &mdash; click it to
+            reveal how its own submodules connect (dashed, read-only, derived
+            straight from the elaborated design). Ctrl/Cmd+C then Ctrl/Cmd+V
+            duplicates the selected block.
+          </p>
+        </div>
       </div>
 
-      <div class="panel legend">
-        <h2>Legend</h2>
-        <div class="legend-row"><span class="swatch input"></span> input pin</div>
-        <div class="legend-row"><span class="swatch output"></span> output pin</div>
-        <div class="legend-row"><span class="swatch inout"></span> inout pin</div>
-        <p class="rules">
-          Wires run output&nbsp;&rarr;&nbsp;input (or through an inout).
-          An input takes exactly one wire; output&harr;output and
-          input&harr;input connections are rejected.
-        </p>
-        <p class="rules">
-          A block with a &#9656; has internal structure &mdash; click it to
-          reveal how its own submodules connect (dashed, read-only, derived
-          straight from the elaborated design). Ctrl/Cmd+C then Ctrl/Cmd+V
-          duplicates the selected block.
-        </p>
+      <div id="tab-inspector" class="sidebar-tab hidden">
+        <div class="panel">
+          <p id="inspector-empty" class="empty">Select a block to inspect it.</p>
+          <div id="inspector-body" class="hidden">
+            <div class="panel-head">
+              <h2 id="inspector-name">&nbsp;</h2>
+              <span id="inspector-kind" class="count"></span>
+            </div>
+            <p id="inspector-meta" class="empty"></p>
+
+            <label class="field">
+              <span>Note</span>
+              <textarea id="inspector-note" rows="4" placeholder="Notes on this block&hellip;"></textarea>
+            </label>
+
+            <div id="inspector-test" class="hidden">
+              <h2>Tests</h2>
+              <div id="inspector-tests-list"></div>
+            </div>
+            <p id="inspector-no-test" class="empty"></p>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-waveform" class="sidebar-tab hidden">
+        <div class="panel wide-panel">
+          <div class="panel-head">
+            <h2>Waveform</h2>
+            <span id="waveform-status" class="status-pill idle hidden"></span>
+          </div>
+          <p id="waveform-empty" class="empty">Run a test from the Inspector tab to see its waveform here.</p>
+          <div id="waveform-body" class="hidden">
+            <p id="waveform-meta" class="empty"></p>
+            <div class="zoom-controls wave-zoom">
+              <button id="wave-zoom-out" title="Zoom out">&minus;</button>
+              <span id="wave-zoom-level">100%</span>
+              <button id="wave-zoom-in" title="Zoom in">+</button>
+              <button id="wave-zoom-reset" title="Reset zoom">reset</button>
+            </div>
+            <div id="waveform-scroller">
+              <svg id="waveform-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+            </div>
+          </div>
+        </div>
       </div>
     </aside>
 
@@ -68,7 +123,8 @@
           <button id="zoom-in" title="Zoom in">+</button>
           <button id="zoom-reset" title="Reset view">reset</button>
         </div>
-        <span id="hint">drag to pan &middot; scroll to zoom &middot; drag pin-to-pin to wire &middot; Ctrl/Cmd+C/V duplicates a block &middot; &#9656; expands internal wiring &middot; double-click a title to rename &middot; Delete removes selection</span>
+        <button id="btn-auto-layout" title="Re-lay-out blocks left-to-right by data flow to reduce crossing wires">&#8942;&#8942; Auto-organize</button>
+        <span id="hint">drag to pan &middot; scroll to zoom &middot; right-click-drag to box-select &middot; drag pin-to-pin to wire &middot; Ctrl/Cmd+C/V duplicates block(s) &middot; &#9656; expands internal wiring &middot; double-click a title to rename &middot; Delete removes selection</span>
       </div>
       <div id="scroller">
         <svg id="canvas" xmlns="http://www.w3.org/2000/svg">
@@ -99,13 +155,17 @@
 
   <div id="modal-overlay" class="hidden">
     <div id="modal">
-      <h2>New custom block</h2>
+      <h2 id="modal-title">New custom block</h2>
       <label class="field">
         <span>Name</span>
         <input id="cb-name" type="text" placeholder="Glue logic" autocomplete="off">
       </label>
       <div id="cb-ports"></div>
       <button id="cb-add-port" type="button" class="full ghost">+ port</button>
+      <p id="cb-io-hint" class="rules hidden">
+        A top-level IO marker exposes one boundary port &mdash; wire it to a
+        block's pin to mark that pin as part of the system's external interface.
+      </p>
       <div class="modal-actions">
         <button id="cb-cancel" type="button">Cancel</button>
         <button id="cb-create" type="button" class="primary">Place block</button>

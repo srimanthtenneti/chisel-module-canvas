@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """module_canvas server — a small background utility to run alongside a
-Chisel project, whether that's a plain sbt build or a Chisel/Almond Jupyter
-notebook session.
+Chisel project, whether that's a plain sbt build or a Chisel/Almond
+Jupyter notebook session.
 
 It does two things:
 
   1. Accepts POSTed IO descriptions from Chisel modules as they're
-     elaborated (see modulecanvas.ModuleRegistry.registerModule) and keeps
-     a version history per module name, so the browser palette always has
-     a "latest" pick per module plus the ability to go back.
+     elaborated (see modulecanvas.ModuleRegistry.registerModule) and
+     keeps a version history per module name, so the browser palette
+     always has a "latest" pick per module plus the ability to go back.
   2. Serves a browser-based canvas (static/) where those modules can be
      dragged out as blocks, wired together, or where you can hand-draw a
      custom rectangle with your own ports.
@@ -26,23 +26,41 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import subprocess
+import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import vcd_parser  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 DATA_DIR = ROOT / "data"
 MODULES_FILE = DATA_DIR / "modules.json"
 CANVAS_FILE = DATA_DIR / "canvas.json"
+TESTS_FILE = DATA_DIR / "tests.json"
 
 VALID_DIRS = {"input", "output", "inout"}
 EMPTY_HIERARCHY = {"children": [], "wires": []}
+TEST_TIMEOUT_SECONDS = 180
+TEST_SIGNAL_SCOPE_SUFFIX = ".svsimTestbench"
+TEST_HARNESS_INTERNAL_SIGNALS = {"simulationState", "traceSupported"}
 
 _lock = threading.Lock()
+_tests_lock = threading.Lock()
+_runs_lock = threading.Lock()
+# sbt runs one server-socket per project directory; two concurrent `sbt`
+# invocations against the same project race on it and fail outright ("Address
+# already in use"). Serialize actual test execution through this lock so
+# clicking "Run test" on several blocks in a row queues them instead of
+# corrupting each other.
+_sbt_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------
@@ -69,8 +87,14 @@ def _save_json(path: Path, obj) -> None:
 
 # registry shape: { moduleName: { "versions": [ {version, timestamp, ports}, ... ] } }
 _registry: dict = _load_json(MODULES_FILE, {})
-# canvas shape: { "blocks": [...], "wires": [...] }
+# canvas shape: { "blocks": [...], "wires": [...] }  (each block may carry a free-text "note")
 _canvas: dict = _load_json(CANVAS_FILE, {"blocks": [], "wires": []})
+# test registry shape:
+#   { "sbtDir": "...", "pkg": "...",
+#     "tests": { moduleName: [ {"id": "Test_Foo", "label": "..."}, ... ] } }
+_test_registry: dict = _load_json(TESTS_FILE, {"sbtDir": None, "pkg": None, "tests": {}})
+# in-memory only — a run's log/waveform is only useful while the server is up
+_test_runs: dict = {}  # runId -> {"state": "running"|"done", "result": {...}|None}
 
 
 def _now() -> str:
@@ -84,6 +108,7 @@ def _latest_modules() -> list:
         if not versions:
             continue
         latest = versions[-1]
+        tests = _test_registry.get("tests", {}).get(name, [])
         out.append(
             {
                 "name": name,
@@ -92,6 +117,8 @@ def _latest_modules() -> list:
                 "ports": latest["ports"],
                 "hierarchy": latest.get("hierarchy", EMPTY_HIERARCHY),
                 "versionCount": len(versions),
+                "hasTest": len(tests) > 0,
+                "tests": tests,
             }
         )
     out.sort(key=lambda m: m["name"].lower())
@@ -212,6 +239,121 @@ def register_module(name: str, ports: list, hierarchy=None) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Test execution — driven by tools/module_canvas/register_notebook.py's
+# generated notebookgen.Test_<Module> objects. Each run shells out to sbt,
+# which can take anywhere from a few seconds to ~30s (Chisel elaboration +
+# verilator compile + simulate), so this always runs in a background thread;
+# the client polls for the result rather than holding one HTTP request open.
+# --------------------------------------------------------------------------
+
+def register_tests(sbt_dir: str, pkg: str, tests: dict) -> dict:
+    if not sbt_dir or not pkg:
+        raise ValueError("sbtDir and pkg are required")
+    if not isinstance(tests, dict):
+        raise ValueError("tests must be an object of {moduleName: [{id, label}, ...]}")
+    cleaned = {}
+    count = 0
+    for name, entries in tests.items():
+        name = str(name).strip()
+        if not name or not isinstance(entries, list):
+            continue
+        clean_entries = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            test_id = str(e.get("id", "")).strip()
+            label = str(e.get("label", "")).strip() or test_id
+            if test_id:
+                clean_entries.append({"id": test_id, "label": label})
+        if clean_entries:
+            cleaned[name] = clean_entries
+            count += len(clean_entries)
+    with _tests_lock:
+        global _test_registry
+        _test_registry = {"sbtDir": sbt_dir, "pkg": pkg, "tests": cleaned}
+        _save_json(TESTS_FILE, _test_registry)
+    return {"status": "ok", "count": count}
+
+
+def _filter_waveform_signals(parsed: dict) -> dict:
+    """Keep only the DUT's own boundary ports (the testbench-scope signals),
+    dropping internal implementation state (Mem contents, loop counters,
+    simulator-harness bookkeeping) that would otherwise clutter the view."""
+    keep = [
+        s
+        for s in parsed["signals"]
+        if s["scope"].endswith(TEST_SIGNAL_SCOPE_SUFFIX) and s["name"] not in TEST_HARNESS_INTERNAL_SIGNALS
+    ]
+    keep_ids = {s["id"] for s in keep}
+    parsed["signals"] = keep
+    parsed["changes"] = {vid: chs for vid, chs in parsed["changes"].items() if vid in keep_ids}
+    return parsed
+
+
+def _find_test(module_name: str, test_id: str):
+    for entry in _test_registry.get("tests", {}).get(module_name, []):
+        if entry["id"] == test_id:
+            return entry
+    return None
+
+
+def _run_test_worker(run_id: str, module_name: str, test_id: str) -> None:
+    with _tests_lock:
+        reg = dict(_test_registry)
+        entry = _find_test(module_name, test_id)
+    sbt_dir = reg.get("sbtDir")
+    pkg = reg.get("pkg")
+
+    result = {"module": module_name, "testId": test_id, "status": "error", "log": "", "waveform": None}
+    try:
+        if not sbt_dir or not pkg or not entry:
+            result["log"] = f"No test '{test_id}' registered for '{module_name}'. Re-run register_notebook.py."
+        else:
+            # state starts "queued" (set by start_test_run); flips to "running"
+            # only once this run actually holds the lock and sbt is launched,
+            # so concurrent "Run test" clicks visibly queue instead of racing.
+            # subdir is keyed by test_id (not just module) so sibling tests
+            # for the same module don't overwrite each other's waveform.
+            cmd = ["sbt", "-batch", f"-DtestSubdir={test_id}", f"runMain {pkg}.{test_id}"]
+            with _sbt_lock:
+                with _runs_lock:
+                    _test_runs[run_id] = {"state": "running", "result": None}
+                proc = subprocess.run(
+                    cmd, cwd=sbt_dir, capture_output=True, text=True, timeout=TEST_TIMEOUT_SECONDS
+                )
+            log = proc.stdout[-8000:]
+            if proc.returncode != 0 and proc.stderr:
+                log += "\n" + proc.stderr[-2000:]
+            result["log"] = log
+            result["status"] = "pass" if proc.returncode == 0 else "fail"
+
+            vcd_path = Path(sbt_dir) / "build" / "canvas-tests" / test_id / "workdir-verilator" / "trace.vcd"
+            if vcd_path.exists():
+                try:
+                    parsed = vcd_parser.parse_vcd_file(str(vcd_path))
+                    result["waveform"] = _filter_waveform_signals(parsed)
+                except Exception as e:  # a parse failure shouldn't hide the pass/fail result
+                    result["log"] += f"\n[waveform parse failed: {type(e).__name__}: {e}]"
+    except subprocess.TimeoutExpired:
+        result["status"] = "error"
+        result["log"] = f"Test run timed out after {TEST_TIMEOUT_SECONDS}s."
+    except Exception as e:
+        result["status"] = "error"
+        result["log"] = f"{type(e).__name__}: {e}"
+
+    with _runs_lock:
+        _test_runs[run_id] = {"state": "done", "result": result}
+
+
+def start_test_run(module_name: str, test_id: str) -> str:
+    run_id = uuid.uuid4().hex
+    with _runs_lock:
+        _test_runs[run_id] = {"state": "queued", "result": None}
+    threading.Thread(target=_run_test_worker, args=(run_id, module_name, test_id), daemon=True).start()
+    return run_id
+
+
+# --------------------------------------------------------------------------
 # HTTP handler
 # --------------------------------------------------------------------------
 
@@ -291,6 +433,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(_canvas)
             return
 
+        if path.startswith("/api/run-test/"):
+            run_id = path[len("/api/run-test/") :]
+            with _runs_lock:
+                run = _test_runs.get(run_id)
+            if run is None:
+                self._send_error_json("unknown run id", 404)
+            else:
+                self._send_json(run)
+            return
+
         # static assets (index.html, app.js, style.css, ...)
         target = self._static_path_for(path)
         if target is None:
@@ -324,6 +476,35 @@ class Handler(BaseHTTPRequestHandler):
                     _canvas = body
                     _save_json(CANVAS_FILE, _canvas)
                 self._send_json({"status": "saved", "time": _now()})
+            except (ValueError, json.JSONDecodeError) as e:
+                self._send_error_json(str(e), 400)
+            return
+
+        if path == "/api/register-tests":
+            try:
+                body = self._read_json_body()
+                result = register_tests(body.get("sbtDir"), body.get("pkg"), body.get("tests", {}))
+                print(f"  registered {result['count']} test(s) for sbt project {body.get('sbtDir')}")
+                self._send_json(result)
+            except (ValueError, json.JSONDecodeError) as e:
+                self._send_error_json(str(e), 400)
+            return
+
+        if path == "/api/run-test":
+            try:
+                body = self._read_json_body()
+                module_name = str(body.get("module", "")).strip()
+                if not module_name:
+                    raise ValueError("module is required")
+                entries = _test_registry.get("tests", {}).get(module_name, [])
+                if not entries:
+                    raise ValueError(f"no test registered for '{module_name}'")
+                test_id = str(body.get("testId", "")).strip() or entries[0]["id"]
+                if not any(e["id"] == test_id for e in entries):
+                    raise ValueError(f"'{test_id}' is not a registered test for '{module_name}'")
+                run_id = start_test_run(module_name, test_id)
+                print(f"  starting test run '{run_id}' for '{module_name}' ({test_id})")
+                self._send_json({"runId": run_id, "state": "queued"})
             except (ValueError, json.JSONDecodeError) as e:
                 self._send_error_json(str(e), 400)
             return

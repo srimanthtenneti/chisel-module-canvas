@@ -243,6 +243,48 @@ Re-run that line any time you change the module — see "Versioning" below.
 This never throws: if the server isn't running, you get a printed note
 and the notebook session continues unaffected.
 
+### Registering many modules at once: `register_notebook.py`
+
+If your modules already live in a Chisel/Almond notebook, you don't have
+to write any `registerModule` calls by hand at all:
+
+```bash
+python3 server/register_notebook.py path/to/Notebook.ipynb --sbt-dir .
+```
+
+This scans the notebook for every top-level `class ... extends Module`
+(or `RawModule`), generates a small standalone sbt sub-project
+(`src/main/scala/notebookgen/` by default — override with `--pkg`) that
+instantiates and registers each module whose constructor needs no
+required arguments, and runs it. Modules with required constructor
+parameters are skipped and listed, since the tool has no way to know what
+value you'd want.
+
+It also scans for any `simulate(new X) { dut => ... }` cell already in
+the notebook — the same `chisel3.simulator` test style you'd write
+interactively — and, for each one, generates a VCD-tracing runnable
+wrapper registered with the server as that module's "Run test" action
+(see "Tests & waveforms" below). A module can have more than one test
+cell; all of them show up, each labeled from its leading `//` comment if
+it has one.
+
+Useful flags:
+
+```bash
+python3 server/register_notebook.py Notebook.ipynb --sbt-dir examples \
+  --host localhost --port 8765 \
+  --registry-pkg modulecanvas \   # package containing your ModuleRegistry
+  --pkg notebookgen \             # package name for the generated driver
+  --no-run                        # generate the Scala only, don't invoke sbt
+```
+
+`--registry-pkg` matters if you copied `ModuleRegistry.scala` into your
+own project under a different package name than `modulecanvas` — it's
+what the generated driver calls `registerModule` on. Re-run the whole
+command any time the notebook changes; it regenerates and re-registers
+everything from scratch, safely (existing versions on the server aren't
+touched — see "Versioning" below).
+
 ### What gets sent
 
 Every port on the module — including nested `Bundle`/`Vec` fields,
@@ -325,6 +367,78 @@ assignment rather than element-by-element) is expanded into one wire per
 matching flattened index on both sides; if the two sides don't have the
 same number of indexed ports, nothing is drawn for that connect rather
 than guessing a pairing.
+
+### Tests & waveforms
+
+A module block that has one or more `simulate(...)` cells registered
+against it (via `register_notebook.py` — see above) shows a "Tests"
+section in the Inspector tab when selected, one card per test, each with
+its own "Run test" button and status pill (`queued` → `running` →
+`pass`/`fail`/`error`). Runs go through `sbt` in the background: firing
+off several at once queues them rather than racing sbt's own server
+socket, so nothing silently fails from clicking around.
+
+Once a run finishes, its card gets a "view waveform" link that switches
+to the Waveform tab and renders the VCD trace `chisel3.simulator` wrote
+during that run — signal names down the left, zoomable/scrollable
+timeline, `0`/`1`/`x`/`z` and multi-bit values all rendered directly from
+the trace file, not summarized. Internal testbench-only signals are
+filtered out so what you see matches the module's actual IO plus any
+named internal registers/wires it declares.
+
+Blocks with no test cell — custom blocks, top-level IO markers, and any
+module you haven't written a `simulate(...)` cell for — show a note in
+the Inspector saying so instead of an empty test list.
+
+### Notes
+
+Every block (module, custom, or IO marker) has a free-text "Note" field
+in the Inspector tab, saved with the rest of the canvas. It's not shown
+on the block itself — it's a place to record context (why this version
+is pinned, what's still TODO on this wiring, a link to the ticket) that
+would otherwise only live in your head or a separate doc.
+
+### Top-level IO markers
+
+"+ Top-level IO" opens a small modal for exactly one named, directioned,
+sized port — no repeatable rows, since a boundary marker only ever needs
+one. The resulting block renders with a dashed amber outline instead of
+the normal panel styling, so it reads at a glance as "this is the edge of
+the system" rather than another internal block. Wire it to a pin the
+same way you'd wire any two blocks together; the connection-direction
+rules are unchanged (a marker's output pin drives an input pin
+elsewhere, and so on).
+
+### Auto-organize layout
+
+The toolbar's "Auto-organize" button re-lays-out every block on the
+canvas in one pass: it layers blocks left-to-right by data flow (a
+block's layer is one more than the deepest layer of anything driving it)
+and orders blocks within each layer by a barycenter heuristic against
+their neighbors, the standard approach for minimizing edge crossings in a
+layered graph. Useful after placing blocks in whatever order you clicked
+them in the palette, or after a session of ad hoc dragging has left wires
+crossing each other more than they need to. It repositions blocks only —
+it doesn't change any wiring — and is itself undoable only by dragging
+things back, so it's worth a glance before your next save if the new
+layout isn't what you wanted.
+
+### Multi-select
+
+Right-click and drag anywhere on empty canvas to draw a selection box;
+every block it overlaps is selected together (a tiny drag, under a few
+pixels, just clears the selection instead — so an accidental right-click
+doesn't select anything). `Shift`-click toggles one block into or out of
+an existing selection without needing to redraw the box. With multiple
+blocks selected:
+
+- Drag any one of them to move the whole group together, preserving
+  their relative positions.
+- `Ctrl`/`Cmd`+`C` then `Ctrl`/`Cmd`+`V` copies the whole group — including
+  the wires between selected blocks — as a new set of independent
+  instances.
+- `Delete`/`Backspace` removes every selected block (and their wires) at
+  once.
 
 ### Versioning
 

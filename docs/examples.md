@@ -48,24 +48,32 @@ This reproduces the main README's hero screenshot.
 
 1. Click **DemoSystem** in the palette to place it.
 2. Click **ButtonConditioner** to place a second, independent instance —
-   drag it below and to the left so the two don't overlap.
+   drag it above and to the left so the two don't overlap.
 3. Click **+ Custom block**. Name it `LED Driver`, and add two ports:
    `pressed_in` (input) and `led_out` (output). Click **Place block**.
-4. Drag from `ButtonConditioner`'s `io_pressed` output pin to
+4. Click **+ Top-level IO**. Name it `board_button`, set its direction to
+   `output` (it's *driving* a pin — direction here means "which way this
+   boundary signal flows," not the polarity of the physical button), leave
+   the width at 1, and click **Place block**.
+5. Drag from `ButtonConditioner`'s `io_pressed` output pin to
    `LED Driver`'s `pressed_in` input pin.
-5. Drag from `LED Driver`'s `led_out` output pin to `DemoSystem`'s
+6. Drag from `LED Driver`'s `led_out` output pin to `DemoSystem`'s
    `io_deqReady` input pin (any spare input works — this is just to show
    a second wire; it isn't meant to be functionally meaningful).
+7. Drag from `board_button`'s `port` pin to `ButtonConditioner`'s
+   `io_raw` input pin.
 
-You now have two registered modules and one hand-drawn block, wired
-together with direction-checked, color-coded connections:
+You now have two registered modules, one hand-drawn block, and one
+top-level IO marker, wired together with direction-checked, color-coded
+connections:
 
-![Two registered modules and a custom block, wired](images/palette-and-canvas.png)
+![Two registered modules, a custom block, and a top-level IO marker, wired](images/palette-and-canvas.png)
 
-Try wiring `LED Driver`'s `led_out` to `ButtonConditioner`'s `io_raw`
-input too — it's allowed, since `io_raw` doesn't have a driver yet. Then
-try wiring it to `io_pressed` (an output) instead: you'll get a toast
-explaining that two outputs can't be wired together.
+Try wiring `LED Driver`'s `led_out` to `board_button`'s `port` pin too —
+you'll get a toast explaining that `io_raw` already has a driver (the IO
+marker) and one input takes exactly one wire. Then try wiring `led_out`
+to `ButtonConditioner`'s `io_pressed` (an output) instead: same rejection,
+different reason — two outputs can't be wired together.
 
 ## 3. Expand DemoSystem's internal wiring
 
@@ -121,3 +129,39 @@ with a version dropdown. If you already had a v1 `Debouncer` placed on
 the canvas, its refresh icon (in its title bar) is now live — click it to
 jump that instance to v2, keeping any wires on ports that still exist by
 name.
+
+## 6. The notebook workflow, tests, and waveforms
+
+Everything above used the explicit `sbt "runMain demo.RegisterDemo"`
+driver. `examples/DemoNotebook.ipynb` is the same eight modules, written
+as notebook cells instead, plus three `simulate(...)` test cells — two on
+`Debouncer`, one on `Prescaler` — to show off the test/waveform feature.
+Register from it instead:
+
+```bash
+python3 server/register_notebook.py examples/DemoNotebook.ipynb --sbt-dir examples
+```
+
+The console output lists which modules were found and which test cells
+were detected for which module — no `RegisterDemo`-style driver needed,
+and no `ModuleRegistry` calls anywhere in the notebook. Open the canvas,
+place `Debouncer`, select it, and switch to the **Inspector** tab: you'll
+see two test cards (one per `simulate(...)` cell notebook-side). Click
+**Run test** on either — it queues, runs through `sbt` in the background,
+and lands on `pass` with a **view waveform** link that jumps to the
+**Waveform** tab and renders the actual VCD trace from that run:
+
+![Waveform tab after running Prescaler's test](images/waveform-viewer.png)
+
+Two more things worth trying on this same scene:
+
+- **"+ Top-level IO"**, wired to `Debouncer`'s `raw` input — marks it as
+  a boundary pin rather than internal glue; it renders with a dashed
+  amber outline instead of the normal block styling.
+- **"Auto-organize"** after placing several blocks in whatever order you
+  clicked them — it re-lays-out the whole canvas left-to-right by data
+  flow to cut down on crossing wires, and right-click-dragging a box over
+  several blocks first (multi-select) lets you move, copy, or delete them
+  as one group afterward.
+
+Full reference for all three: `usage-guide.md`.

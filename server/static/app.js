@@ -69,6 +69,7 @@ const state = {
 let registryLatest = []; // from /api/modules
 let registryAll = {}; // from /api/modules/all
 let selected = null; // {type:'block'|'wire', id}
+let multiSelectedIds = new Set(); // block ids additionally selected via marquee/shift-click
 let dragState = null;
 let dirty = false;
 let clipboard = null;
@@ -243,9 +244,15 @@ function resolvePositions(layoutPorts, portName) {
     .map((k) => layoutPorts[k]);
 }
 
+function blockKindLabel(block) {
+  if (block.kind === "module") return `v${block.moduleVersion}`;
+  if (block.kind === "io") return "IO";
+  return "custom";
+}
+
 function computeLayout(block) {
   const children = block.hierarchy && block.hierarchy.children ? block.hierarchy.children : [];
-  const subtitle = block.kind === "module" ? `v${block.moduleVersion}` : "custom";
+  const subtitle = blockKindLabel(block);
   return layoutNode(block.ports, children, !!block.expanded, block.label || block.name, subtitle);
 }
 
@@ -292,6 +299,107 @@ function straightPath(a, b) {
 }
 
 // ============================================================================
+// auto-layout — a layered (Sugiyama-style) pass that reduces crossing wires
+// by putting drivers to the left of what they drive (matching the fixed
+// input-left/output-right pin convention every block already uses) and
+// ordering blocks within each layer by barycenter to untangle the rest.
+// ============================================================================
+
+function autoLayout() {
+  if (state.blocks.length === 0) return;
+  state.blocks.forEach((b) => (b._layout = computeLayout(b)));
+
+  const succ = {};
+  const pred = {};
+  state.blocks.forEach((b) => {
+    succ[b.id] = new Set();
+    pred[b.id] = new Set();
+  });
+  state.wires.forEach((w) => {
+    if (w.from.blockId === w.to.blockId) return;
+    if (!succ[w.from.blockId] || !succ[w.to.blockId]) return;
+    // driverEnd tells us which side actually drives the wire; for an
+    // inout<->inout wire (no single driver) just pick from->to, which is
+    // still useful for grouping even if the "direction" is nominal.
+    const driver = w.driverEnd === "b" ? w.to.blockId : w.from.blockId;
+    const receiver = w.driverEnd === "b" ? w.from.blockId : w.to.blockId;
+    succ[driver].add(receiver);
+    pred[receiver].add(driver);
+  });
+
+  // longest-path layering, with a cycle guard (a feedback loop just gets
+  // flattened into the layer of whichever node closes it, rather than
+  // recursing forever)
+  const layerOf = {};
+  const visiting = new Set();
+  function computeLayerOf(id) {
+    if (layerOf[id] !== undefined) return layerOf[id];
+    if (visiting.has(id)) return 0;
+    visiting.add(id);
+    let maxPred = -1;
+    pred[id].forEach((p) => {
+      maxPred = Math.max(maxPred, computeLayerOf(p));
+    });
+    visiting.delete(id);
+    layerOf[id] = maxPred + 1;
+    return layerOf[id];
+  }
+  state.blocks.forEach((b) => computeLayerOf(b.id));
+
+  const maxLayer = Math.max(0, ...Object.values(layerOf));
+  const layers = Array.from({ length: maxLayer + 1 }, () => []);
+  state.blocks.forEach((b) => layers[layerOf[b.id]].push(b.id));
+
+  const orderIndex = {};
+  layers.forEach((ids) => ids.forEach((id, idx) => (orderIndex[id] = idx)));
+
+  function barycenterPass(neighborsOf) {
+    layers.forEach((ids, li) => {
+      const scored = ids.map((id) => {
+        const positions = [...neighborsOf(id)].map((n) => orderIndex[n]).filter((v) => v !== undefined);
+        const bc = positions.length ? positions.reduce((a, c) => a + c, 0) / positions.length : orderIndex[id];
+        return { id, bc };
+      });
+      scored.sort((a, b) => a.bc - b.bc);
+      layers[li] = scored.map((s) => s.id);
+      layers[li].forEach((id, idx) => (orderIndex[id] = idx));
+    });
+  }
+  for (let pass = 0; pass < 4; pass++) {
+    barycenterPass((id) => pred[id]);
+    barycenterPass((id) => succ[id]);
+  }
+
+  const H_GAP = 90;
+  const V_GAP = 36;
+  const MARGIN = 60;
+  let x = MARGIN;
+  layers.forEach((ids) => {
+    let maxW = 0;
+    ids.forEach((id) => {
+      const b = state.blocks.find((bl) => bl.id === id);
+      maxW = Math.max(maxW, b._layout.w);
+    });
+    let y = MARGIN;
+    ids.forEach((id) => {
+      const b = state.blocks.find((bl) => bl.id === id);
+      b.x = x;
+      b.y = y;
+      y += b._layout.h + V_GAP;
+    });
+    x += maxW + H_GAP;
+  });
+
+  multiSelectedIds = new Set();
+  selected = null;
+  renderAll();
+  markDirty();
+  showToast("Layout re-organized to reduce crossing wires.", true);
+}
+
+document.getElementById("btn-auto-layout").addEventListener("click", autoLayout);
+
+// ============================================================================
 // rendering
 // ============================================================================
 
@@ -314,6 +422,7 @@ function renderAll() {
   blocksLayer.innerHTML = "";
   state.wires.forEach(renderWire);
   state.blocks.forEach(renderBlock);
+  updateInspector();
 }
 
 function renderWire(wire) {
@@ -343,8 +452,10 @@ function renderWire(wire) {
 }
 
 function renderBlock(block) {
+  const isPrimary = selected && selected.type === "block" && selected.id === block.id;
+  const isMulti = multiSelectedIds.has(block.id);
   const g = svgEl("g", {
-    class: `block${selected && selected.type === "block" && selected.id === block.id ? " selected" : ""}`,
+    class: `block${block.kind === "io" ? " io-block" : ""}${isPrimary || isMulti ? " selected" : ""}`,
     "data-block-id": block.id,
     transform: `translate(${block.x},${block.y})`,
   });
@@ -354,7 +465,7 @@ function renderBlock(block) {
     ports: block.ports,
     wires: (block.hierarchy && block.hierarchy.wires) || [],
     title: block.label || block.name,
-    subtitle: block.kind === "module" ? `v${block.moduleVersion}` : "custom",
+    subtitle: blockKindLabel(block),
     interactivePorts: true,
     blockId: block.id,
     onToggleExpand: block._layout.hasExpandableChildren
@@ -370,11 +481,34 @@ function renderBlock(block) {
   });
 
   g.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
     if (e.target.closest(".port") || e.target.closest(".btn-refresh") || e.target.closest(".btn-expand")) return;
     e.stopPropagation();
+
+    if (e.shiftKey) {
+      // shift-click toggles this block in/out of the multi-selection
+      if (multiSelectedIds.has(block.id)) multiSelectedIds.delete(block.id);
+      else multiSelectedIds.add(block.id);
+      selected = null;
+      renderAll();
+      return;
+    }
+
+    const w0 = toWorld(e.clientX, e.clientY);
+    if (multiSelectedIds.has(block.id) && multiSelectedIds.size > 1) {
+      // dragging a block that's part of an existing multi-selection moves the whole group
+      const origins = {};
+      multiSelectedIds.forEach((id) => {
+        const b = state.blocks.find((x) => x.id === id);
+        if (b) origins[id] = { x: b.x, y: b.y };
+      });
+      dragState = { type: "group", ids: [...multiSelectedIds], startWorld: w0, origins };
+      return;
+    }
+
+    multiSelectedIds.clear();
     selected = { type: "block", id: block.id };
     renderAll();
-    const w0 = toWorld(e.clientX, e.clientY);
     dragState = { type: "block", blockId: block.id, startWorld: w0, origBX: block.x, origBY: block.y };
   });
 
@@ -568,6 +702,46 @@ function clearPreview() {
 }
 
 // ============================================================================
+// marquee (right-click-drag) multi-select
+// ============================================================================
+
+function drawMarquee(start, current) {
+  previewLayer.innerHTML = "";
+  const x = Math.min(start.x, current.x);
+  const y = Math.min(start.y, current.y);
+  const w = Math.abs(current.x - start.x);
+  const h = Math.abs(current.y - start.y);
+  previewLayer.appendChild(svgEl("rect", { x, y, width: w, height: h, class: "marquee-rect" }));
+}
+
+function finishMarquee(start, current) {
+  clearPreview();
+  const x0 = Math.min(start.x, current.x);
+  const y0 = Math.min(start.y, current.y);
+  const x1 = Math.max(start.x, current.x);
+  const y1 = Math.max(start.y, current.y);
+
+  // a click with no real drag (marquee smaller than a few px) just clears selection
+  if (x1 - x0 < 4 && y1 - y0 < 4) {
+    selected = null;
+    multiSelectedIds.clear();
+    renderAll();
+    return;
+  }
+
+  const hits = state.blocks.filter((b) => {
+    const layout = b._layout || computeLayout(b);
+    const bx0 = b.x, by0 = b.y, bx1 = b.x + layout.w, by1 = b.y + layout.h;
+    return bx0 < x1 && bx1 > x0 && by0 < y1 && by1 > y0;
+  });
+
+  multiSelectedIds = new Set(hits.map((b) => b.id));
+  selected = hits.length === 1 ? { type: "block", id: hits[0].id } : null;
+  renderAll();
+  if (hits.length > 1) showToast(`${hits.length} blocks selected.`, true);
+}
+
+// ============================================================================
 // pan / zoom / drag
 // ============================================================================
 
@@ -600,11 +774,20 @@ scroller.addEventListener(
   { passive: false }
 );
 
+scroller.addEventListener("contextmenu", (e) => e.preventDefault());
+
 scroller.addEventListener("mousedown", (e) => {
+  if (e.button === 2) {
+    // right-click-drag: rubber-band marquee select
+    const start = toWorld(e.clientX, e.clientY);
+    dragState = { type: "marquee", start, current: start };
+    return;
+  }
   if (e.button !== 0) return;
   dragState = { type: "pan", startX: e.clientX, startY: e.clientY, origX: view.x, origY: view.y };
   scroller.classList.add("panning");
   selected = null;
+  multiSelectedIds.clear();
   renderAll();
 });
 
@@ -622,6 +805,22 @@ window.addEventListener("mousemove", (e) => {
       block.y = dragState.origBY + (w.y - dragState.startWorld.y);
       renderAll();
     }
+  } else if (dragState.type === "group") {
+    const w = toWorld(e.clientX, e.clientY);
+    const dx = w.x - dragState.startWorld.x;
+    const dy = w.y - dragState.startWorld.y;
+    dragState.ids.forEach((id) => {
+      const b = state.blocks.find((x) => x.id === id);
+      const origin = dragState.origins[id];
+      if (b && origin) {
+        b.x = origin.x + dx;
+        b.y = origin.y + dy;
+      }
+    });
+    renderAll();
+  } else if (dragState.type === "marquee") {
+    dragState.current = toWorld(e.clientX, e.clientY);
+    drawMarquee(dragState.start, dragState.current);
   } else if (dragState.type === "wire") {
     updatePreview(dragState.from, toWorld(e.clientX, e.clientY));
   }
@@ -631,6 +830,10 @@ window.addEventListener("mouseup", (e) => {
   if (!dragState) return;
   if (dragState.type === "pan") scroller.classList.remove("panning");
   if (dragState.type === "block") markDirty();
+  if (dragState.type === "group") markDirty();
+  if (dragState.type === "marquee") {
+    finishMarquee(dragState.start, dragState.current || dragState.start);
+  }
   if (dragState.type === "wire") {
     const portEl = e.target.closest(".port:not(.readonly)");
     if (portEl) {
@@ -681,43 +884,94 @@ function renameBlock(blockId) {
   markDirty();
 }
 
+function selectedBlockIds() {
+  if (multiSelectedIds.size > 0) return [...multiSelectedIds];
+  if (selected && selected.type === "block") return [selected.id];
+  return [];
+}
+
 function copySelected() {
-  if (!selected || selected.type !== "block") return;
-  const block = state.blocks.find((b) => b.id === selected.id);
-  if (!block) return;
-  clipboard = JSON.parse(
-    JSON.stringify({
-      kind: block.kind,
-      name: block.name,
-      moduleVersion: block.moduleVersion,
-      ports: block.ports,
-      hierarchy: block.hierarchy || EMPTY_HIERARCHY,
+  const ids = selectedBlockIds();
+  if (ids.length === 0) return;
+  const idSet = new Set(ids);
+  const blocks = ids
+    .map((id, i) => {
+      const b = state.blocks.find((x) => x.id === id);
+      if (!b) return null;
+      return {
+        _cid: i,
+        kind: b.kind,
+        name: b.name,
+        moduleVersion: b.moduleVersion,
+        x: b.x,
+        y: b.y,
+        ports: b.ports,
+        hierarchy: b.hierarchy || EMPTY_HIERARCHY,
+      };
     })
+    .filter(Boolean);
+  const cidOf = Object.fromEntries(blocks.map((b, i) => [ids[i], b._cid]));
+  const wires = state.wires
+    .filter((w) => idSet.has(w.from.blockId) && idSet.has(w.to.blockId))
+    .map((w) => ({
+      fromCid: cidOf[w.from.blockId],
+      fromPort: w.from.portId,
+      toCid: cidOf[w.to.blockId],
+      toPort: w.to.portId,
+      driverEnd: w.driverEnd,
+      kind: w.kind,
+    }));
+
+  clipboard = JSON.parse(JSON.stringify({ blocks, wires }));
+  showToast(
+    blocks.length > 1 ? `Copied ${blocks.length} blocks. Ctrl/Cmd+V to paste.` : `Copied '${blocks[0].name}'. Ctrl/Cmd+V to paste.`,
+    true
   );
-  showToast(`Copied '${block.label || block.name}'. Ctrl/Cmd+V to paste.`, true);
 }
 
 function pasteClipboard() {
-  if (!clipboard) return;
-  const instanceCount = state.blocks.filter((b) => b.name === clipboard.name).length;
-  const cascade = state.blocks.length * 18;
-  const block = {
-    id: newId("b"),
-    kind: clipboard.kind,
-    name: clipboard.name,
-    label: `${clipboard.name} #${instanceCount + 1}`,
-    moduleVersion: clipboard.moduleVersion,
-    x: 100 + (cascade % 300),
-    y: 100 + (cascade % 260),
-    expanded: false,
-    ports: clipboard.ports.map((p) => ({ ...p })),
-    hierarchy: clipboard.hierarchy,
-  };
-  state.blocks.push(block);
-  selected = { type: "block", id: block.id };
+  if (!clipboard || !clipboard.blocks || !clipboard.blocks.length) return;
+  const OFFSET = 40;
+  const cidToNewId = {};
+  const newIds = [];
+
+  clipboard.blocks.forEach((cb) => {
+    const instanceCount = state.blocks.filter((b) => b.name === cb.name).length;
+    const block = {
+      id: newId("b"),
+      kind: cb.kind,
+      name: cb.name,
+      label: `${cb.name} #${instanceCount + 1}`,
+      moduleVersion: cb.moduleVersion,
+      x: cb.x + OFFSET,
+      y: cb.y + OFFSET,
+      expanded: false,
+      ports: cb.ports.map((p) => ({ ...p })),
+      hierarchy: cb.hierarchy,
+    };
+    state.blocks.push(block);
+    cidToNewId[cb._cid] = block.id;
+    newIds.push(block.id);
+  });
+
+  (clipboard.wires || []).forEach((cw) => {
+    const fromBlockId = cidToNewId[cw.fromCid];
+    const toBlockId = cidToNewId[cw.toCid];
+    if (!fromBlockId || !toBlockId) return;
+    state.wires.push({
+      id: newId("w"),
+      from: { blockId: fromBlockId, portId: cw.fromPort },
+      to: { blockId: toBlockId, portId: cw.toPort },
+      driverEnd: cw.driverEnd,
+      kind: cw.kind,
+    });
+  });
+
+  multiSelectedIds = newIds.length > 1 ? new Set(newIds) : new Set();
+  selected = newIds.length === 1 ? { type: "block", id: newIds[0] } : null;
   renderAll();
   markDirty();
-  showToast(`Pasted another '${clipboard.name}'.`, true);
+  showToast(newIds.length > 1 ? `Pasted ${newIds.length} blocks.` : `Pasted another '${clipboard.blocks[0].name}'.`, true);
 }
 
 window.addEventListener("keydown", (e) => {
@@ -735,21 +989,34 @@ window.addEventListener("keydown", (e) => {
     pasteClipboard();
     return;
   }
-  if ((e.key === "Delete" || e.key === "Backspace") && selected) {
-    if (selected.type === "block") {
-      state.blocks = state.blocks.filter((b) => b.id !== selected.id);
-      state.wires = state.wires.filter((w) => w.from.blockId !== selected.id && w.to.blockId !== selected.id);
-    } else if (selected.type === "wire") {
-      state.wires = state.wires.filter((w) => w.id !== selected.id);
+  if (e.key === "Delete" || e.key === "Backspace") {
+    if (multiSelectedIds.size > 0) {
+      const idSet = multiSelectedIds;
+      state.blocks = state.blocks.filter((b) => !idSet.has(b.id));
+      state.wires = state.wires.filter((w) => !idSet.has(w.from.blockId) && !idSet.has(w.to.blockId));
+      multiSelectedIds = new Set();
+      selected = null;
+      renderAll();
+      markDirty();
+    } else if (selected) {
+      if (selected.type === "block") {
+        state.blocks = state.blocks.filter((b) => b.id !== selected.id);
+        state.wires = state.wires.filter((w) => w.from.blockId !== selected.id && w.to.blockId !== selected.id);
+      } else if (selected.type === "wire") {
+        state.wires = state.wires.filter((w) => w.id !== selected.id);
+      }
+      selected = null;
+      renderAll();
+      markDirty();
     }
-    selected = null;
-    renderAll();
-    markDirty();
   }
   if (e.key === "Escape") {
     closeModal();
     dragState = null;
     clearPreview();
+    multiSelectedIds = new Set();
+    selected = null;
+    renderAll();
   }
 });
 
@@ -913,12 +1180,28 @@ async function pollRegistry() {
 const overlay = document.getElementById("modal-overlay");
 const cbName = document.getElementById("cb-name");
 const cbPorts = document.getElementById("cb-ports");
+const modalTitle = document.getElementById("modal-title");
+const cbAddPort = document.getElementById("cb-add-port");
+const cbIoHint = document.getElementById("cb-io-hint");
 
-function openModal() {
+let modalMode = "custom"; // "custom" | "io"
+
+function openModal(mode) {
+  modalMode = mode || "custom";
   overlay.classList.remove("hidden");
   cbName.value = "";
   cbPorts.innerHTML = "";
-  addPortRow();
+  if (modalMode === "io") {
+    modalTitle.textContent = "New top-level IO";
+    cbAddPort.classList.add("hidden");
+    cbIoHint.classList.remove("hidden");
+    addPortRow({ name: "port", dir: "input", width: 1 });
+  } else {
+    modalTitle.textContent = "New custom block";
+    cbAddPort.classList.remove("hidden");
+    cbIoHint.classList.add("hidden");
+    addPortRow();
+  }
   cbName.focus();
 }
 function closeModal() {
@@ -961,7 +1244,8 @@ function addPortRow(defaults) {
   cbPorts.appendChild(row);
 }
 
-document.getElementById("btn-custom").addEventListener("click", openModal);
+document.getElementById("btn-custom").addEventListener("click", () => openModal("custom"));
+document.getElementById("btn-io-terminal").addEventListener("click", () => openModal("io"));
 document.getElementById("cb-cancel").addEventListener("click", closeModal);
 document.getElementById("cb-add-port").addEventListener("click", () => addPortRow());
 overlay.addEventListener("mousedown", (e) => {
@@ -969,11 +1253,15 @@ overlay.addEventListener("mousedown", (e) => {
 });
 
 document.getElementById("cb-create").addEventListener("click", () => {
-  const name = cbName.value.trim() || "Custom block";
+  const isIo = modalMode === "io";
+  const name = cbName.value.trim() || (isIo ? "IO Port" : "Custom block");
   const ports = [];
   const seen = new Set();
   let droppedDupes = 0;
-  cbPorts.querySelectorAll(".port-row").forEach((row) => {
+  const rows = isIo
+    ? [cbPorts.querySelector(".port-row")].filter(Boolean)
+    : [...cbPorts.querySelectorAll(".port-row")];
+  rows.forEach((row) => {
     const [nameInput, dirSelect, widthInput] = row.querySelectorAll("input,select");
     const pname = nameInput.value.trim();
     if (!pname) return;
@@ -989,10 +1277,14 @@ document.getElementById("cb-create").addEventListener("click", () => {
       width: clamp(parseInt(widthInput.value, 10) || 1, 1, 4096),
     });
   });
+  if (isIo && ports.length === 0) {
+    showToast("Give the IO marker a port name.", false);
+    return;
+  }
   const cascade = state.blocks.length * 18;
   const block = {
     id: newId("b"),
-    kind: "custom",
+    kind: isIo ? "io" : "custom",
     name,
     label: null,
     x: 60 + (cascade % 260),
@@ -1026,6 +1318,7 @@ function serializeCanvas() {
       expanded: !!b.expanded,
       ports: b.ports,
       hierarchy: b.hierarchy || EMPTY_HIERARCHY,
+      note: b.note || null,
     })),
     wires: state.wires,
   };
@@ -1139,6 +1432,328 @@ window.addEventListener("beforeunload", (e) => {
 setInterval(() => {
   if (dirty) saveCanvas();
 }, 8000);
+
+// ============================================================================
+// sidebar tabs
+// ============================================================================
+
+function switchTab(name) {
+  document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  document.getElementById("tab-palette").classList.toggle("hidden", name !== "palette");
+  document.getElementById("tab-inspector").classList.toggle("hidden", name !== "inspector");
+  document.getElementById("tab-waveform").classList.toggle("hidden", name !== "waveform");
+  document.body.classList.toggle("wave-mode", name === "waveform");
+}
+document.querySelectorAll(".tab-btn").forEach((btn) => btn.addEventListener("click", () => switchTab(btn.dataset.tab)));
+
+// ============================================================================
+// inspector — per-block note + "run test" + status
+// ============================================================================
+
+// keyed by `${moduleName}::${testId}`: {state:'idle'|'queued'|'running'|'pass'|'fail'|'error', log:'', waveform:null}
+const testRuns = {};
+let lastWaveform = null; // {module, testId, data}
+
+function getSelectedBlock() {
+  if (!selected || selected.type !== "block") return null;
+  return state.blocks.find((b) => b.id === selected.id) || null;
+}
+
+function runKey(moduleName, testId) {
+  return `${moduleName}::${testId}`;
+}
+
+function updateInspector() {
+  const block = getSelectedBlock();
+  const badge = document.getElementById("inspector-badge");
+  const emptyEl = document.getElementById("inspector-empty");
+  const bodyEl = document.getElementById("inspector-body");
+
+  if (!block) {
+    emptyEl.textContent =
+      multiSelectedIds.size > 1
+        ? `${multiSelectedIds.size} blocks selected — Ctrl/Cmd+C to copy the group, Delete to remove it.`
+        : "Select a block to inspect it.";
+    emptyEl.classList.remove("hidden");
+    bodyEl.classList.add("hidden");
+    badge.classList.toggle("hidden", multiSelectedIds.size === 0);
+    return;
+  }
+
+  emptyEl.classList.add("hidden");
+  bodyEl.classList.remove("hidden");
+  badge.classList.remove("hidden");
+
+  document.getElementById("inspector-name").textContent = block.label || block.name;
+  document.getElementById("inspector-kind").textContent = blockKindLabel(block);
+  document.getElementById("inspector-meta").textContent =
+    block.kind === "module" ? `${block.name} · ${block.ports.length} port(s)` : `${block.ports.length} port(s)`;
+
+  const noteEl = document.getElementById("inspector-note");
+  if (noteEl.dataset.blockId !== block.id || document.activeElement !== noteEl) {
+    noteEl.value = block.note || "";
+  }
+  noteEl.dataset.blockId = block.id;
+
+  const testSection = document.getElementById("inspector-test");
+  const noTestMsg = document.getElementById("inspector-no-test");
+  const mod = registryLatest.find((m) => m.name === block.name);
+  const tests = block.kind === "module" && mod ? mod.tests || [] : [];
+  const hasTest = tests.length > 0;
+  testSection.classList.toggle("hidden", !hasTest);
+  noTestMsg.classList.toggle("hidden", hasTest);
+  if (!hasTest) {
+    noTestMsg.textContent =
+      block.kind !== "module"
+        ? "Custom and IO-marker blocks have no test to run."
+        : "No test cell detected for this module — register it via register_notebook.py.";
+  } else {
+    renderTestList(block.name, tests);
+  }
+}
+
+document.getElementById("inspector-note").addEventListener("input", (e) => {
+  const blockId = e.target.dataset.blockId;
+  const block = state.blocks.find((b) => b.id === blockId);
+  if (block) {
+    block.note = e.target.value;
+    markDirty();
+  }
+});
+
+function renderTestList(moduleName, tests) {
+  const list = document.getElementById("inspector-tests-list");
+  list.innerHTML = "";
+  tests.forEach((t) => {
+    const card = document.createElement("div");
+    card.className = "test-card";
+
+    const label = document.createElement("div");
+    label.className = "test-card-label";
+    label.textContent = t.label;
+    card.appendChild(label);
+
+    const row = document.createElement("div");
+    row.className = "test-row";
+    const runBtn = document.createElement("button");
+    runBtn.className = "full";
+    const pill = document.createElement("span");
+    pill.className = "status-pill idle";
+    pill.textContent = "idle";
+    row.appendChild(runBtn);
+    row.appendChild(pill);
+    card.appendChild(row);
+
+    const logEl = document.createElement("pre");
+    logEl.className = "test-log hidden";
+    card.appendChild(logEl);
+
+    const waveBtn = document.createElement("button");
+    waveBtn.className = "view-waveform-link hidden";
+    waveBtn.textContent = "View waveform →";
+    waveBtn.addEventListener("click", () => {
+      lastWaveform = { module: moduleName, testId: t.id, data: testRuns[runKey(moduleName, t.id)].waveform };
+      renderWaveformTab();
+      switchTab("waveform");
+    });
+    card.appendChild(waveBtn);
+
+    function paint() {
+      const run = testRuns[runKey(moduleName, t.id)] || { state: "idle", log: "", waveform: null };
+      pill.className = "status-pill " + run.state;
+      pill.textContent = run.state;
+      if (run.log) {
+        logEl.textContent = run.log;
+        logEl.classList.remove("hidden");
+      } else {
+        logEl.classList.add("hidden");
+      }
+      waveBtn.classList.toggle("hidden", !run.waveform);
+      const busy = run.state === "running" || run.state === "queued";
+      runBtn.disabled = busy;
+      runBtn.textContent = run.state === "running" ? "Running…" : run.state === "queued" ? "Queued…" : "▶ Run test";
+    }
+    paint();
+    card._paint = paint;
+
+    runBtn.addEventListener("click", () => runTest(moduleName, t.id));
+    list.appendChild(card);
+  });
+}
+
+async function runTest(moduleName, testId) {
+  const key = runKey(moduleName, testId);
+  testRuns[key] = { state: "queued", log: "", waveform: null };
+  repaintTestCards();
+  try {
+    const res = await fetch("/api/run-test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ module: moduleName, testId }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "failed to start test");
+    pollTestRun(moduleName, testId, data.runId);
+  } catch (e) {
+    testRuns[key] = { state: "error", log: String(e.message || e), waveform: null };
+    repaintTestCards();
+  }
+}
+
+async function pollTestRun(moduleName, testId, runId) {
+  const key = runKey(moduleName, testId);
+  let data;
+  try {
+    const res = await fetch(`/api/run-test/${runId}`);
+    data = await res.json();
+  } catch (e) {
+    testRuns[key] = { state: "error", log: String(e.message || e), waveform: null };
+    repaintTestCards();
+    return;
+  }
+  if (data.state === "running" || data.state === "queued") {
+    testRuns[key] = { state: data.state, log: "", waveform: null };
+    repaintTestCards();
+    setTimeout(() => pollTestRun(moduleName, testId, runId), 1200);
+    return;
+  }
+  const r = data.result || { status: "error", log: "no result returned", waveform: null };
+  testRuns[key] = { state: r.status, log: r.log || "", waveform: r.waveform || null };
+  repaintTestCards();
+}
+
+function repaintTestCards() {
+  document.querySelectorAll("#inspector-tests-list .test-card").forEach((card) => card._paint && card._paint());
+}
+
+// ============================================================================
+// waveform tab — renders a parsed VCD (signals + sparse [time,value] changes)
+// ============================================================================
+
+const WAVE_NAME_W = 130;
+const WAVE_ROW_H = 34;
+const WAVE_TOP_PAD = 26;
+const waveZoom = { pxPerUnit: 6 };
+
+function renderWaveformTab() {
+  const emptyEl = document.getElementById("waveform-empty");
+  const bodyEl = document.getElementById("waveform-body");
+  const statusPill = document.getElementById("waveform-status");
+
+  if (!lastWaveform) {
+    emptyEl.classList.remove("hidden");
+    bodyEl.classList.add("hidden");
+    statusPill.classList.add("hidden");
+    return;
+  }
+  emptyEl.classList.add("hidden");
+  bodyEl.classList.remove("hidden");
+
+  const run = testRuns[runKey(lastWaveform.module, lastWaveform.testId)];
+  statusPill.classList.remove("hidden");
+  statusPill.className = "status-pill " + (run ? run.state : "idle");
+  statusPill.textContent = run ? run.state : "";
+
+  const sigCount = lastWaveform.data.signals.length;
+  document.getElementById("waveform-meta").textContent =
+    `${lastWaveform.module} — ${sigCount} signal${sigCount === 1 ? "" : "s"}, ${lastWaveform.data.endTime} time units`;
+
+  drawWaveformSvg(lastWaveform.data);
+}
+
+function niceTickStep(endTime) {
+  const target = Math.max(1, Math.floor(endTime / 10));
+  const steps = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000];
+  return steps.find((s) => s >= target) || steps[steps.length - 1];
+}
+
+function drawWaveformSvg(data) {
+  const svg = document.getElementById("waveform-svg");
+  svg.innerHTML = "";
+  const px = waveZoom.pxPerUnit;
+  const traceW = Math.max(300, data.endTime * px + 40);
+  const w = WAVE_NAME_W + traceW;
+  const h = WAVE_TOP_PAD + data.signals.length * WAVE_ROW_H + 6;
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", h);
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+
+  const step = niceTickStep(data.endTime);
+  for (let t = 0; t <= data.endTime; t += step) {
+    const x = WAVE_NAME_W + t * px;
+    svg.appendChild(svgEl("line", { x1: x, y1: 0, x2: x, y2: h, class: "wave-tick" }));
+    svg.appendChild(svgEl("text", { x: x + 3, y: 12, class: "wave-tick-label" }, String(t)));
+  }
+  svg.appendChild(svgEl("line", { x1: WAVE_NAME_W, y1: 0, x2: WAVE_NAME_W, y2: h, class: "wave-row-sep" }));
+
+  data.signals.forEach((sig, i) => {
+    const y = WAVE_TOP_PAD + i * WAVE_ROW_H;
+    svg.appendChild(svgEl("rect", { x: 0, y, width: WAVE_NAME_W, height: WAVE_ROW_H, class: "wave-name-bg" }));
+    svg.appendChild(svgEl("text", { x: 8, y: y + WAVE_ROW_H / 2 + 3, class: "wave-sig-name" }, sig.name));
+    if (sig.width > 1) {
+      svg.appendChild(
+        svgEl(
+          "text",
+          { x: WAVE_NAME_W - 6, y: y + WAVE_ROW_H / 2 + 3, "text-anchor": "end", class: "wave-sig-width" },
+          `[${sig.width - 1}:0]`
+        )
+      );
+    }
+    svg.appendChild(svgEl("line", { x1: 0, y1: y + WAVE_ROW_H, x2: w, y2: y + WAVE_ROW_H, class: "wave-row-sep" }));
+
+    const changes = data.changes[sig.id] || [];
+    if (sig.width === 1) drawBitTrace(svg, changes, y, px, data.endTime);
+    else drawBusTrace(svg, changes, y, px, data.endTime);
+  });
+}
+
+function drawBitTrace(svg, changes, rowY, px, endTime) {
+  if (!changes.length) return;
+  const yHigh = rowY + 8;
+  const yLow = rowY + WAVE_ROW_H - 8;
+  const xOf = (t) => WAVE_NAME_W + t * px;
+  const levelY = (v) => (v === "1" ? yHigh : yLow);
+  let d = "";
+  let prevVal = null;
+  changes.forEach(([t, v], idx) => {
+    const x = xOf(t);
+    if (idx === 0) {
+      d += `M${x},${levelY(v)}`;
+    } else {
+      d += ` L${x},${levelY(prevVal)} L${x},${levelY(v)}`;
+    }
+    prevVal = v;
+  });
+  d += ` L${xOf(endTime)},${levelY(prevVal)}`;
+  svg.appendChild(svgEl("path", { d, class: "wave-trace" }));
+}
+
+function drawBusTrace(svg, changes, rowY, px, endTime) {
+  if (!changes.length) return;
+  const y0 = rowY + 6;
+  const y1 = rowY + WAVE_ROW_H - 6;
+  const xOf = (t) => WAVE_NAME_W + t * px;
+  changes.forEach(([t, v], idx) => {
+    const x0 = xOf(t);
+    const x1 = idx + 1 < changes.length ? xOf(changes[idx + 1][0]) : xOf(endTime);
+    if (x1 <= x0) return;
+    svg.appendChild(svgEl("rect", { x: x0, y: y0, width: x1 - x0, height: y1 - y0, class: "wave-bus-fill" }));
+    if (x1 - x0 > 18) {
+      svg.appendChild(
+        svgEl("text", { x: (x0 + x1) / 2, y: (y0 + y1) / 2 + 3, "text-anchor": "middle", class: "wave-bus-text" }, String(v))
+      );
+    }
+  });
+}
+
+function setWaveZoom(px) {
+  waveZoom.pxPerUnit = clamp(px, 1, 80);
+  document.getElementById("wave-zoom-level").textContent = `${Math.round((waveZoom.pxPerUnit / 6) * 100)}%`;
+  if (lastWaveform) drawWaveformSvg(lastWaveform.data);
+}
+document.getElementById("wave-zoom-in").addEventListener("click", () => setWaveZoom(waveZoom.pxPerUnit * 1.4));
+document.getElementById("wave-zoom-out").addEventListener("click", () => setWaveZoom(waveZoom.pxPerUnit / 1.4));
+document.getElementById("wave-zoom-reset").addEventListener("click", () => setWaveZoom(6));
 
 // ============================================================================
 // init

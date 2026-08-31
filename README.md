@@ -10,7 +10,13 @@ straight from CIRCT's elaboration output, not hand-drawn. Wiring between
 blocks is direction-checked as you draw it: no shorting two outputs
 together, no leaving an input undriven by wiring it to another input.
 
-![module_canvas — palette, two registered modules, a custom block, wired together](docs/images/palette-and-canvas.png)
+Point `server/register_notebook.py` at a Chisel/Almond notebook and every
+module it defines shows up in the palette with no `registerModule` calls
+written by hand; any `simulate(new X) {...}` test cell you've already
+written becomes a "Run test" button on that block, complete with a
+waveform viewer once it passes or fails.
+
+![module_canvas — palette, several registered modules, a custom block and a top-level IO marker, wired together](docs/images/palette-and-canvas.png)
 
 ## Why
 
@@ -28,18 +34,21 @@ actually looks like as of the last time you ran `registerModule`.
 
 ```text
 .
-├── server/                 # the tool itself — run this, point a browser at it
-│   ├── server.py           # stdlib-only Python HTTP server (no pip install needed)
-│   └── static/              # the canvas frontend: index.html, app.js, style.css
-├── examples/                # a small, fully dummy Chisel project to try it against
+├── server/                     # the tool itself — run this, point a browser at it
+│   ├── server.py               # stdlib-only Python HTTP server (no pip install needed)
+│   ├── register_notebook.py    # scans a .ipynb and auto-registers every module + test in it
+│   ├── vcd_parser.py           # pure-Python VCD reader for the waveform viewer
+│   └── static/                 # the canvas frontend: index.html, app.js, style.css
+├── examples/                    # a small, fully dummy Chisel project to try it against
 │   ├── build.sbt
+│   ├── DemoNotebook.ipynb       # the same demo modules + a few tests, as a notebook
 │   └── src/main/scala/
-│       ├── modulecanvas/    # ModuleRegistry + HierarchyParser — the Chisel-side library
-│       └── demo/            # DemoSystem and friends — see docs/examples.md
+│       ├── modulecanvas/        # ModuleRegistry + HierarchyParser — the Chisel-side library
+│       └── demo/                # DemoSystem and friends — see docs/examples.md
 └── docs/
-    ├── usage-guide.md        # every interaction, in detail
-    ├── examples.md           # walk through the screenshots above, step by step
-    └── images/               # screenshots used in this README and the guides
+    ├── usage-guide.md            # every interaction, in detail
+    ├── examples.md                # walk through the screenshots above, step by step
+    └── images/                    # screenshots used in this README and the guides
 ```
 
 ## Quickstart
@@ -49,9 +58,15 @@ actually looks like as of the last time you ran `registerModule`.
 python3 server/server.py
 # -> http://127.0.0.1:8765
 
-# 2. In another terminal, register the bundled dummy modules
-cd examples
-sbt "runMain demo.RegisterDemo"
+# 2. In another terminal, register the bundled dummy modules — either:
+
+# (a) the notebook workflow: scans DemoNotebook.ipynb, registers every
+#     module it defines and every simulate(...) test cell, no manual
+#     ModuleRegistry calls required
+python3 server/register_notebook.py examples/DemoNotebook.ipynb --sbt-dir examples
+
+# (b) the plain-sbt workflow: an explicit RegisterDemo driver
+cd examples && sbt "runMain demo.RegisterDemo"
 
 # 3. Open the canvas
 open http://127.0.0.1:8765/   # or just point a browser at it
@@ -59,8 +74,11 @@ open http://127.0.0.1:8765/   # or just point a browser at it
 
 Click a module in the left palette to place it, drag from a pin to another
 pin to wire two blocks together, and click the `▸` on `DemoSystem` to see
-its internal structure. Full interaction reference: `docs/usage-guide.md`.
-Full walkthrough of the bundled example: `docs/examples.md`.
+its internal structure. If you used the notebook workflow, open a block
+that has tests (`Debouncer`, `Prescaler`) from the Inspector tab and hit
+"Run test" to see it simulate and trace a waveform. Full interaction
+reference: `docs/usage-guide.md`. Full walkthrough of the bundled example:
+`docs/examples.md`.
 
 ## Using it in your own project
 
@@ -97,6 +115,29 @@ exact scope of what's recovered are in `docs/usage-guide.md`.
 
 ## Everything else
 
+- **Auto-load from a notebook** — `server/register_notebook.py` scans any
+  Chisel/Almond `.ipynb`, finds every `class ... extends Module`, and
+  generates + runs the sbt driver that registers each one — no
+  `registerModule` boilerplate in the notebook at all. It also detects any
+  `simulate(new X) {...}` test cell for a module (more than one is fine —
+  every one shows up) and wires it up as that block's "Run test" button.
+- **Per-block tests + waveform viewer** — a module with a detected test
+  gets a "Tests" section in the Inspector tab; "Run test" runs it through
+  `sbt` in the background (queued, not dropped, if you fire off several at
+  once) and a passing or failing run gets a "view waveform" link that
+  opens a real, zoomable VCD trace on the Waveform tab.
+- **Notes** — the Inspector tab has a free-text note field per block,
+  saved with the canvas — a place to write down why a block is wired the
+  way it is, without cluttering the diagram itself.
+- **Top-level IO markers** — "+ Top-level IO" places a single-port marker
+  block (dashed amber outline) you wire straight to a pin, to mark it as
+  part of the system's external interface rather than internal glue.
+- **Auto-organize layout** — the toolbar's "Auto-organize" re-lays-out
+  every block left-to-right by data flow (a layered, crossing-minimizing
+  pass), for when manual placement has turned into a criss-cross of wires.
+- **Multi-select** — right-click-drag a box over several blocks to select
+  them together, then move, copy/paste, or delete the whole group at
+  once; `Shift`-click adds or removes one block from the selection.
 - **Custom blocks** — not every box needs to come from Chisel. "+ Custom
   block" opens a small form to hand-draw a rectangle with your own named,
   directioned, sized ports — for glue logic, external IP, anything that
@@ -117,14 +158,18 @@ exact scope of what's recovered are in `docs/usage-guide.md`.
 
 ![the "+ Custom block" form](docs/images/custom-block-modal.png)
 
+![the Waveform tab after running Prescaler's test — clock, reset, and the periodic io_tick pulse](docs/images/waveform-viewer.png)
+
 ## Design notes
 
 - **Zero third-party dependencies on the server.** `python3 server/server.py`
   should just work next to whatever Python or Scala toolchain your project
   already has, without installing anything into it.
 - **Push-based, not auto-detected.** Nothing watches your build or your
-  notebook kernel. You call `registerModule` for whatever you want
-  tracked, whenever you want the canvas to see it.
+  notebook kernel in the background. Either you call `registerModule`
+  for whatever you want tracked, or you re-run `register_notebook.py`
+  after editing the notebook — both are things you do on purpose, not
+  something that happens on save.
 - **A diagram tool, not a simulator.** Connections are checked for
   direction legality, not bit-width compatibility — wiring a 4-bit pin to
   an 8-bit pin is drawn without complaint.
